@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quest VR はじめての空間</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: sans-serif; }
+    #info {
+      position: absolute; top: 12px; left: 12px; z-index: 10;
+      background: rgba(0,0,0,.55); color: #fff; padding: 10px 14px;
+      border-radius: 10px; font-size: 14px; line-height: 1.6; max-width: 80vw;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">
+    👓 Questのブラウザでこのページを開いて<br>
+    右下の <b>「VR」ボタン</b> を押すと空間に入れるよ。<br>
+    コントローラのトリガーで箱を掴める。
+  </div>
+
+  <!-- Three.js 本体（GitHub Pagesなど本物のURLで動く） -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { VRButton } from 'three/addons/webxr/VRButton.js';
+    import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+    // --- 基本セットアップ ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101820);
+
+    const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 100);
+    camera.position.set(0, 1.6, 3); // 立ってる人の目の高さ
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.xr.enabled = true; // ← これでVR対応になる
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(VRButton.createButton(renderer)); // ← VRボタン
+
+    // --- 光 ---
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 1.2));
+    const dir = new THREE.DirectionalLight(0xffffff, 1);
+    dir.position.set(2, 4, 2);
+    scene.add(dir);
+
+    // --- 床 ---
+    const floor = new THREE.Mesh(
+      new THREE.CircleGeometry(6, 48),
+      new THREE.MeshStandardMaterial({ color: 0x223344 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    scene.add(floor);
+    const grid = new THREE.GridHelper(12, 24, 0x4488ff, 0x224466);
+    scene.add(grid);
+
+    // --- 浮かぶ箱たち（掴める対象） ---
+    const grabbable = [];
+    const colors = [0xff5566, 0x55ff88, 0x5599ff, 0xffcc44, 0xcc66ff];
+    for (let i = 0; i < 5; i++) {
+      const box = new THREE.Mesh(
+        new THREE.BoxGeometry(0.25, 0.25, 0.25),
+        new THREE.MeshStandardMaterial({ color: colors[i], roughness: 0.4, metalness: 0.2 })
+      );
+      const a = (i / 5) * Math.PI * 2;
+      box.position.set(Math.cos(a) * 1.3, 1.3 + Math.sin(i) * 0.2, Math.sin(a) * 1.3);
+      scene.add(box);
+      grabbable.push(box);
+    }
+
+    // --- コントローラ ---
+    const controllerModelFactory = new XRControllerModelFactory();
+    function setupController(index) {
+      const controller = renderer.xr.getController(index);
+      scene.add(controller);
+
+      const grip = renderer.xr.getControllerGrip(index);
+      grip.add(controllerModelFactory.createControllerModel(grip));
+      scene.add(grip);
+
+      // 前方に伸びるレイ（照準）
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -5)]),
+        new THREE.LineBasicMaterial({ color: 0xffffff })
+      );
+      controller.add(line);
+
+      controller.addEventListener('selectstart', () => onGrab(controller));
+      controller.addEventListener('selectend', () => onRelease(controller));
+      return controller;
+    }
+    const controllers = [setupController(0), setupController(1)];
+
+    const raycaster = new THREE.Raycaster();
+    const tmpMatrix = new THREE.Matrix4();
+
+    function onGrab(controller) {
+      tmpMatrix.identity().extractRotation(controller.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMatrix);
+      const hits = raycaster.intersectObjects(grabbable);
+      if (hits.length) {
+        const obj = hits[0].object;
+        controller.attach(obj); // 手に持たせる
+        controller.userData.held = obj;
+      }
+    }
+    function onRelease(controller) {
+      const obj = controller.userData.held;
+      if (obj) {
+        scene.attach(obj); // 空間に戻す
+        controller.userData.held = null;
+      }
+    }
+
+    // --- ループ ---
+    renderer.setAnimationLoop(() => {
+      grabbable.forEach((b) => { if (!b.parent || b.parent === scene) b.rotation.y += 0.01; });
+      renderer.render(scene, camera);
+    });
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+  </script>
+</body>
+</html>

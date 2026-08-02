@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VRで手描き3Dモデル</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: sans-serif; background:#000; }
+    #hud {
+      position: absolute; top: 12px; left: 12px; z-index: 10;
+      background: rgba(0,0,0,.6); color: #fff; padding: 12px 16px;
+      border-radius: 12px; font-size: 14px; line-height: 1.7; max-width: 82vw;
+    }
+    #hud b { color:#7cf; }
+    .btns { position:absolute; bottom:16px; left:16px; z-index:10; display:flex; gap:8px; }
+    .btns button {
+      background:#1d2733; color:#fff; border:1px solid #3a4a5a; border-radius:10px;
+      padding:10px 14px; font-size:14px; cursor:pointer;
+    }
+    .btns button:active { background:#2a3a4a; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    ✏️ <b>VRで空中に手描き 3D モデル</b><br>
+    トリガー長押し … 線を描く（離すと1本完成）<br>
+    グリップ（横ボタン）… ブラシの色を変える<br>
+    A / X ボタン … ひとつ戻す（Undo）<br>
+    B / Y ボタン … <b>.glb で保存</b>（3Dモデル書き出し）
+  </div>
+  <div class="btns">
+    <button id="undoBtn">↩ Undo</button>
+    <button id="colorBtn">🎨 色</button>
+    <button id="exportBtn">💾 .glb 保存</button>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { VRButton } from 'three/addons/webxr/VRButton.js';
+    import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+    import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+
+    // ---------- 基本 ----------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d1017);
+
+    const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 100);
+    camera.position.set(0, 1.6, 0.6);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(VRButton.createButton(renderer));
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.4));
+    const dir = new THREE.DirectionalLight(0xffffff, 1.1);
+    dir.position.set(2, 4, 2); scene.add(dir);
+
+    // 床（位置の目安）
+    const grid = new THREE.GridHelper(10, 20, 0x335577, 0x1a2a3a);
+    scene.add(grid);
+
+    // 描いた線をまとめる入れ物（これを丸ごと.glbで書き出す）
+    const artwork = new THREE.Group();
+    scene.add(artwork);
+
+    // ---------- ブラシ ----------
+    const palette = [0xff5566, 0x55ff88, 0x5599ff, 0xffcc44, 0xcc66ff, 0xffffff, 0xff9933];
+    let colorIndex = 0;
+    const brushRadius = 0.008; // 線の太さ
+
+    const strokes = []; // 完成した線（Undo用）
+
+    // 各コントローラの「描画中」状態
+    const drawState = new Map();
+
+    function newColor() {
+      colorIndex = (colorIndex + 1) % palette.length;
+    }
+
+    function startStroke(controller) {
+      const mat = new THREE.MeshStandardMaterial({
+        color: palette[colorIndex], roughness: 0.5, metalness: 0.1,
+        emissive: palette[colorIndex], emissiveIntensity: 0.15
+      });
+      const stroke = { points: [], mesh: null, material: mat };
+      drawState.set(controller, stroke);
+    }
+
+    function extendStroke(controller) {
+      const stroke = drawState.get(controller);
+      if (!stroke) return;
+      const p = new THREE.Vector3().setFromMatrixPosition(controller.matrixWorld);
+      const last = stroke.points[stroke.points.length - 1];
+      if (last && p.distanceTo(last) < 0.006) return; // 動いた時だけ点を足す
+      stroke.points.push(p);
+      rebuild(stroke);
+    }
+
+    function rebuild(stroke) {
+      if (stroke.points.length < 2) return;
+      const curve = new THREE.CatmullRomCurve3(stroke.points);
+      const tubularSeg = Math.max(4, stroke.points.length * 4);
+      const geo = new THREE.TubeGeometry(curve, tubularSeg, brushRadius, 8, false);
+      if (stroke.mesh) {
+        stroke.mesh.geometry.dispose();
+        stroke.mesh.geometry = geo;
+      } else {
+        stroke.mesh = new THREE.Mesh(geo, stroke.material);
+        artwork.add(stroke.mesh);
+      }
+    }
+
+    function endStroke(controller) {
+      const stroke = drawState.get(controller);
+      drawState.delete(controller);
+      if (stroke && stroke.mesh) strokes.push(stroke.mesh);
+    }
+
+    function undo() {
+      const m = strokes.pop();
+      if (m) {
+        artwork.remove(m);
+        m.geometry.dispose();
+        m.material.dispose();
+      }
+    }
+
+    // ---------- 書き出し（.glb） ----------
+    function exportGLB() {
+      if (artwork.children.length === 0) { flash('まだ何も描いてないよ'); return; }
+      const exporter = new GLTFExporter();
+      exporter.parse(artwork, (result) => {
+        const blob = new Blob([result], { type: 'model/gltf-binary' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'my-vr-model.glb';
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        flash('.glb を保存したよ');
+      }, (err) => { console.error(err); flash('書き出し失敗: ' + err); }, { binary: true });
+    }
+
+    function flash(msg) {
+      const hud = document.getElementById('hud');
+      const old = hud.innerHTML;
+      hud.innerHTML = '✅ ' + msg;
+      setTimeout(() => hud.innerHTML = old, 1600);
+    }
+
+    // 画面ボタン（PCテスト用）
+    document.getElementById('undoBtn').onclick = undo;
+    document.getElementById('colorBtn').onclick = newColor;
+    document.getElementById('exportBtn').onclick = exportGLB;
+
+    // ---------- コントローラ ----------
+    const factory = new XRControllerModelFactory();
+    function setupController(i) {
+      const controller = renderer.xr.getController(i);
+      scene.add(controller);
+
+      const grip = renderer.xr.getControllerGrip(i);
+      grip.add(factory.createControllerModel(grip));
+      scene.add(grip);
+
+      // ペン先の小さな点
+      const tip = new THREE.Mesh(
+        new THREE.SphereGeometry(0.012, 12, 12),
+        new THREE.MeshBasicMaterial({ color: 0xffffff })
+      );
+      controller.add(tip);
+      controller.userData.tip = tip;
+
+      controller.addEventListener('selectstart', () => startStroke(controller));
+      controller.addEventListener('selectend',   () => endStroke(controller));
+      controller.addEventListener('squeezestart', () => newColor());
+      return controller;
+    }
+    const controllers = [setupController(0), setupController(1)];
+
+    // A/B(X/Y)ボタンはゲームパッドから直接読む（押した瞬間だけ反応）
+    const btnPrev = new WeakMap();
+    function pollButtons() {
+      const session = renderer.xr.getSession();
+      if (!session) return;
+      for (const src of session.inputSources) {
+        if (!src.gamepad) continue;
+        const b = src.gamepad.buttons;
+        const prev = btnPrev.get(src) || {};
+        // 4 = A/X, 5 = B/Y（Quest Touch）
+        if (b[4] && b[4].pressed && !prev.a) undo();
+        if (b[5] && b[5].pressed && !prev.b) exportGLB();
+        btnPrev.set(src, { a: b[4] && b[4].pressed, b: b[5] && b[5].pressed });
+      }
+    }
+
+    // ---------- ループ ----------
+    renderer.setAnimationLoop(() => {
+      // 描画中のコントローラを伸ばす + ペン先の色を更新
+      controllers.forEach((c) => {
+        if (c.userData.tip) c.userData.tip.material.color.setHex(palette[colorIndex]);
+        if (drawState.has(c)) extendStroke(c);
+      });
+      pollButtons();
+      renderer.render(scene, camera);
+    });
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+  </script>
+</body>
+</html>
