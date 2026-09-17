@@ -85,6 +85,7 @@
     const PEEL_PER_PULL = 0.55; // 手（布）を1m引くと剥がれの半径が何m広がるか
     const MAX_BREAK = 40;   // 1コマで外れる最大数（剥がれが追いつく速さ）
     const COLLAPSE_ON_RELEASE = 0.45, COLLAPSE_WHILE_GRAB = 0.7;
+    const DISSOLVE_SEC = 1.6; // 手を離した布切れがコードに分解されて消えるまでの秒数
     const INTRO_SEC = 6.5;  // 現実にコードが降ってきて壁になるまでの秒数
     const RAIN_COLS = 160, RAIN_ROWS = 72; // コードのマス目（横一周・縦）
     const HEAD_R = 0.3;     // 布が頭をすり抜けない範囲 m
@@ -147,6 +148,7 @@
       geo.computeVertexNormals();
       geo.setAttribute('nRest', new THREE.BufferAttribute(geo.attributes.normal.array.slice(), 3));
       geo.setAttribute('aFree', new THREE.BufferAttribute(new Float32Array(N), 1));
+      geo.setAttribute('aDiss', new THREE.BufferAttribute(new Float32Array(N), 1));
     }
     const pos = geo.attributes.position.array;
     const prev = new Float32Array(rest);
@@ -169,7 +171,16 @@
     for (let iy = 0; iy <= SEG_H; iy++) addC(vid(iy, 0), vid(iy, SEG_W)); // 継ぎ目を縫う
     const CA = Int32Array.from(cA), CB = Int32Array.from(cB), CL = Float32Array.from(cL);
     const NC = CA.length;
-    const alive = new Uint8Array(NC).fill(1);
+    // 点ごとの「つながっている糸」一覧（手に持っている布切れを辿るため）
+    const adjStart = new Int32Array(N + 1), adjC = new Int32Array(NC * 2);
+    {
+      for (let c = 0; c < NC; c++) { adjStart[CA[c] + 1]++; adjStart[CB[c] + 1]++; }
+      for (let i = 0; i < N; i++) adjStart[i + 1] += adjStart[i];
+      const fill = adjStart.slice(0, N);
+      for (let c = 0; c < NC; c++) { adjC[fill[CA[c]]++] = c; adjC[fill[CB[c]]++] = c; }
+    }
+    const diss = geo.attributes.aDiss.array; // 0=ふつう → 1=消えた
+    const held = new Uint8Array(N), bfs = new Int32Array(N);
     // 破れ目をギザギザにするための、点ごとのゆらぎ（なめらかなノイズ）
     const jag = new Float32Array(N);
     for (let i = 0; i < N; i++) {
@@ -185,16 +196,17 @@
         opacity: { value: 1 },
       },
       vertexShader: `
-        attribute vec3 nRest; attribute float aFree;
+        attribute vec3 nRest; attribute float aFree; attribute float aDiss;
+        varying float vDiss;
         varying vec2 vUv; varying vec3 vN; varying vec3 vNR; varying float vFree;
         void main() {
-          vUv = uv; vN = normal; vNR = nRest; vFree = aFree;
+          vUv = uv; vN = normal; vNR = nRest; vFree = aFree; vDiss = aDiss;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
         }`,
       fragmentShader: `
         precision highp float;
         uniform sampler2D atlas; uniform float uTime; uniform float uIntro; uniform float opacity;
-        varying vec2 vUv; varying vec3 vN; varying vec3 vNR; varying float vFree;
+        varying vec2 vUv; varying vec3 vN; varying vec3 vNR; varying float vFree; varying float vDiss;
         const float COLS = ${RAIN_COLS}.0, ROWS = ${RAIN_ROWS}.0;
         float h1(float n) { return fract(sin(n * 127.1 + 3.7) * 43758.5453); }
         float h2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -236,6 +248,14 @@
           gcol = gcol * shown + vec3(0.85, 1.0, 0.9) * frontHead * 1.2;
           float bgA = clamp((uIntro - 2.6 - h1(col * 7.7) * 1.4 - (row / ROWS) * 1.2) / 1.2, 0.0, 1.0);
 
+          // 分解：まず黒い地が抜けて文字だけ光り、文字がひとつずつ消えていく
+          if (vDiss > 0.001) {
+            float hd = h2(cell + 17.0);
+            if (vDiss > 0.995 || hd < vDiss * 1.2 - 0.2) discard;
+            bgA *= 1.0 - smoothstep(0.0, 0.35, vDiss);
+            if (hd < vDiss * 1.2) gcol = vec3(0.7, 1.0, 0.78) * 1.4;          // 消える直前に白く光る
+            else gcol = max(gcol, vec3(0.1, 1.0, 0.35) * smoothstep(0.0, 0.3, vDiss));
+          }
           gcol *= glyph;
           if (gl_FrontFacing) gcol *= 0.45;                    // 外側（裏）は暗め
           gcol *= 0.35 + 0.65 * k;
@@ -267,7 +287,7 @@
       if (state !== 'covered') return false;
       const idx = [];
       for (let i = 0; i < N; i++) {
-        if (grabOf[i] !== -1) continue;
+        if (grabOf[i] !== -1 || diss[i] > 0.5) continue;
         const d = Math.hypot(pos[i*3]-hitPoint.x, pos[i*3+1]-hitPoint.y, pos[i*3+2]-hitPoint.z);
         if (d < GRAB_R) idx.push(i);
       }
@@ -301,7 +321,7 @@
       for (let s = 0; s < grabs.length; s++) grabs[s] = null;
       grabOf.fill(-1);
       pos.set(rest); prev.set(rest);
-      pinned.fill(1); alive.fill(1);
+      pinned.fill(1); diss.fill(0); geo.attributes.aDiss.needsUpdate = true;
       clothMat.uniforms.opacity.value = 1;
       state = 'intro'; stateT = 0;
       cloth.visible = true;
@@ -329,9 +349,8 @@
       }
       for (let it = 0; it < ITER; it++) {
         for (let c = 0; c < NC; c++) {
-          if (!alive[c]) continue;
           const a = CA[c], b = CB[c];
-          if (pinned[a] !== pinned[b]) { alive[c] = 0; continue; } // 貼ってある所と剥がれた所の境目は切れる
+          if (pinned[a] || pinned[b]) continue; // 貼ってある所との糸は効かない（剥がれた布どうしは1枚につながったまま）
           const wa = (pinned[a] || grabOf[a] >= 0) ? 0 : 1;
           const wb = (pinned[b] || grabOf[b] >= 0) ? 0 : 1;
           if (wa + wb === 0) continue;
@@ -415,7 +434,8 @@
     function rayHit(ctrl) {
       setRay(ctrl);
       raycaster.far = 30;
-      return cloth.visible ? raycaster.intersectObject(cloth, false)[0] : null;
+      if (!cloth.visible) return null;
+      return raycaster.intersectObject(cloth, false).find(h => diss[h.face.a] < 0.5 || diss[h.face.b] < 0.5 || diss[h.face.c] < 0.5) || null;
     }
 
     const cp = new THREE.Vector3();
@@ -459,7 +479,7 @@
       audioOn();
       mouse.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
       raycaster.setFromCamera(mouse, camera);
-      const hit = cloth.visible && raycaster.intersectObject(cloth, false)[0];
+      const hit = cloth.visible && raycaster.intersectObject(cloth, false).find(h => diss[h.face.a] < 0.5 || diss[h.face.b] < 0.5 || diss[h.face.c] < 0.5);
       if (!hit) return;
       mouseDist = hit.distance;
       startGrab(2, hit.point, hit.point);
@@ -592,6 +612,27 @@
         let n = 0;
         while (acc >= H_DT && n < 3) { step(H_DT); acc -= H_DT; n++; }
         if (n === 3) acc = 0;
+      }
+
+      // 手から離れた布切れ（持っている所と糸でつながっていない所）はコードに分解されて消える
+      if (state !== 'intro' && state !== 'reality') {
+        held.fill(0);
+        let qn = 0;
+        for (let i = 0; i < N; i++) if (grabOf[i] >= 0) { held[i] = 1; bfs[qn++] = i; }
+        for (let qi = 0; qi < qn; qi++) {
+          const v = bfs[qi];
+          for (let e = adjStart[v]; e < adjStart[v + 1]; e++) {
+            const c = adjC[e];
+            const o = CA[c] === v ? CB[c] : CA[c];
+            if (!held[o] && !pinned[o]) { held[o] = 1; bfs[qn++] = o; }
+          }
+        }
+        let changed = false;
+        for (let i = 0; i < N; i++) {
+          if (pinned[i] || held[i] || diss[i] >= 1) continue;
+          diss[i] = Math.min(1, diss[i] + dt / DISSOLVE_SEC); changed = true;
+        }
+        if (changed) geo.attributes.aDiss.needsUpdate = true;
       }
 
       if (cloth.visible) {
