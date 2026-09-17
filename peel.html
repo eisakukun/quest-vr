@@ -449,19 +449,43 @@
 
     // ================= 入力：手・コントローラー =================
     const inputs = [];
-    // つかんだ時だけ、手にほとんど透明な光をうっすら出す
-    const glowGeo = new THREE.SphereGeometry(0.04, 24, 16);
+    // 手の光：つかめる距離まで手を伸ばすと光り始め、つかむと強く光る
+    // ※加算合成だとQuestのパススルーの上でほぼ見えないので、前もって乗算した色＋ふつうの重ね方にする
+    const GRAB_REACH0 = 0.3, GRAB_REACH1 = 0.5; // 体の中心から手までの距離：ここから光り始めて、ここで最大
+    const glowGeo = new THREE.SphereGeometry(0.035, 24, 16);
     function makeGlowMat() {
       return new THREE.ShaderMaterial({
         uniforms: { uAlpha: { value: 0 } },
         vertexShader: `varying vec3 vN; varying vec3 vV;
           void main() { vec4 mv = modelViewMatrix * vec4(position, 1.0); vN = normalize(normalMatrix * normal); vV = normalize(-mv.xyz); gl_Position = projectionMatrix * mv; }`,
         fragmentShader: `uniform float uAlpha; varying vec3 vN; varying vec3 vV;
-          void main() { float fr = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 2.0); float a = uAlpha * (0.25 + 0.75 * fr);
-            gl_FragColor = vec4(vec3(0.8, 1.0, 0.9) * a, a); }`,
-        transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+          void main() {
+            float fr = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 1.5);
+            float a = clamp(uAlpha * (0.45 + 0.55 * fr), 0.0, 1.0);
+            gl_FragColor = vec4(mix(vec3(0.75, 1.0, 0.85), vec3(0.2, 1.0, 0.5), fr) * a, a);
+          }`,
+        transparent: true, depthWrite: false, depthTest: false, premultipliedAlpha: true,
       });
     }
+    // 膜の上の「ここが亀裂になる」縦の短い光の線
+    const markGeo = new THREE.PlaneGeometry(0.03, 0.16);
+    function makeMarkMat() {
+      return new THREE.ShaderMaterial({
+        uniforms: { uAlpha: { value: 0 }, uTime: shared.uTime },
+        vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `uniform float uAlpha; uniform float uTime; varying vec2 vUv;
+          void main() {
+            float x = abs(vUv.x - 0.5) * 2.0, y = abs(vUv.y - 0.5) * 2.0;
+            float core = pow(max(0.0, 1.0 - x), 6.0) * (1.0 - y * y);
+            float halo = pow(max(0.0, 1.0 - x), 2.0) * (1.0 - y) * 0.35;
+            float flick = 0.85 + 0.15 * sin(uTime * 18.0 + vUv.y * 20.0);
+            float a = clamp((core + halo) * uAlpha * flick, 0.0, 1.0);
+            gl_FragColor = vec4(mix(vec3(0.2, 1.0, 0.5), vec3(0.9, 1.0, 0.95), core) * a, a);
+          }`,
+        transparent: true, depthWrite: false, depthTest: false, premultipliedAlpha: true,
+      });
+    }
+    let fakeHand = null; // パソコン確認用：手の位置のまね
     for (let i = 0; i < 2; i++) {
       const ctrl = renderer.xr.getController(i);
       const grip = renderer.xr.getControllerGrip(i);
@@ -469,9 +493,11 @@
       scene.add(ctrl); scene.add(grip); scene.add(hand);
       const glow = new THREE.Mesh(glowGeo, makeGlowMat());
       glow.renderOrder = 12; glow.visible = false; scene.add(glow);
-      const info = { ctrl, grip, hand, glow, glowA: 0, glowPulse: 0, source: null, btnPrev: false, p: new THREE.Vector3() };
+      const mark = new THREE.Mesh(markGeo, makeMarkMat());
+      mark.renderOrder = 12; mark.visible = false; scene.add(mark);
+      const info = { ctrl, grip, hand, glow, mark, glowA: 0, glowPulse: 0, hover: 0, wasReady: false, source: null, btnPrev: false, p: new THREE.Vector3() };
       ctrl.addEventListener('connected', e => { info.source = e.data; });
-      ctrl.addEventListener('disconnected', () => { info.source = null; grabEnd(i); glow.visible = false; });
+      ctrl.addEventListener('disconnected', () => { info.source = null; grabEnd(i); glow.visible = false; mark.visible = false; });
       const down = () => { audioOn(); if (pointOf(info)) grabStart(i, info.p); };
       const up = () => grabEnd(i);
       ctrl.addEventListener('selectstart', down); ctrl.addEventListener('selectend', up);
@@ -498,27 +524,57 @@
     function updateInputs(dt) {
       for (let i = 0; i < inputs.length; i++) {
         const c = inputs[i];
-        if (!renderer.xr.isPresenting || !pointOf(c)) { c.glow.visible = false; continue; }
+        const fake = !renderer.xr.isPresenting && i === 0 && fakeHand;
+        if (fake) c.p.copy(fakeHand);
+        else if (!renderer.xr.isPresenting || !pointOf(c)) { c.glow.visible = false; c.mark.visible = false; continue; }
         if (grabbing[i]) {
           const moved = grabMove(i, c.p);
           rustle = Math.max(rustle, moved * 30);
-          const gp = c.source.gamepad;
+          const gp = c.source && c.source.gamepad;
           if (gp && gp.hapticActuators && gp.hapticActuators[0] && moved > 0.002) {
             try { gp.hapticActuators[0].pulse(Math.min(0.6, moved * 40), 20); } catch (e) {}
           }
         }
-        // 手のうっすら光：つかんだ瞬間にふわっと、つかんでいる間はごく薄く、離すと消える
-        const target = grabbing[i] ? 0.06 + 0.14 * c.glowPulse : 0;
-        c.glowPulse = Math.max(0, c.glowPulse - dt / 0.35);
-        c.glowA += (target - c.glowA) * Math.min(1, dt * (target > c.glowA ? 25 : 8));
-        c.glow.visible = c.glowA > 0.003;
+        // つかめる所まで手が来ているか（伸ばすほど 0→1。めくれの先の近くなら 1）
+        let near = null, ready = 0;
+        if (!grabbing[i]) {
+          const dist = c.p.distanceTo(C);
+          ready = Math.min(1, Math.max(0, (dist - GRAB_REACH0) / (GRAB_REACH1 - GRAB_REACH0)));
+          near = nearestFlap(c.p);
+          if (near) ready = 1;
+        }
+        c.hover += (ready - c.hover) * Math.min(1, dt * 12);
+        // コントローラーは、つかめる範囲に入った瞬間に軽くブルッ
+        const isReady = ready > 0.99;
+        if (isReady && !c.wasReady && c.source && c.source.gamepad && c.source.gamepad.hapticActuators && c.source.gamepad.hapticActuators[0]) {
+          try { c.source.gamepad.hapticActuators[0].pulse(0.25, 30); } catch (e) {}
+        }
+        c.wasReady = isReady;
+
+        // 手の光：つかめる所で光り（ゆっくり息をするように）、つかんだ瞬間に強く、つかんでいる間も見える明るさ
+        const breathe = 0.85 + 0.15 * Math.sin(shared.uTime.value * 5);
+        const target = grabbing[i] ? 0.45 + 0.55 * c.glowPulse : c.hover * 0.5 * breathe;
+        c.glowPulse = Math.max(0, c.glowPulse - dt / 0.4);
+        c.glowA += (target - c.glowA) * Math.min(1, dt * (target > c.glowA ? 25 : 10));
+        c.glow.visible = c.glowA > 0.01;
         if (c.glow.visible) {
           c.glow.position.copy(c.p);
           c.glow.material.uniforms.uAlpha.value = c.glowA;
-          c.glow.scale.setScalar(1 + 0.25 * c.glowPulse);
+          c.glow.scale.setScalar(1 + 0.2 * c.hover + 0.5 * c.glowPulse);
+        }
+        // 膜の上の印：つかむとそこに亀裂が入る場所（めくれの先の近くなら、その先）
+        const markA = grabbing[i] ? 0 : c.hover * 0.9;
+        c.mark.visible = markA > 0.02;
+        if (c.mark.visible) {
+          const rel = V().subVectors(c.p, C);
+          if (near) c.mark.position.copy(near.tip);
+          else c.mark.position.copy(C).addScaledVector(rel.normalize(), R * 0.98);
+          c.mark.lookAt(head.x, c.mark.position.y, head.z);
+          c.mark.material.uniforms.uAlpha.value = markA;
+          c.mark.scale.setScalar(near ? 1.3 : 1);
         }
         // A/X（4番）かB/Y（5番）で全部閉じる
-        const gp = c.source.gamepad;
+        const gp = c.source && c.source.gamepad;
         if (gp && !c.source.hand) {
           const pressed = !!((gp.buttons[4] && gp.buttons[4].pressed) || (gp.buttons[5] && gp.buttons[5].pressed));
           if (pressed && !c.btnPrev) reset();
@@ -866,7 +922,7 @@
     }
 
     // 動作確認用
-    window.__peel = { get audio() { return audio; }, startTitle, frame, setView(y, p) { yaw = y; pitch = p; }, grabStart, grabMove, grabEnd, reset, flaps, C,
+    window.__peel = { setFakeHand(p) { fakeHand = p; }, get audio() { return audio; }, startTitle, frame, setView(y, p) { yaw = y; pitch = p; }, grabStart, grabMove, grabEnd, reset, flaps, C,
       V: (x, y, z) => new THREE.Vector3(x, y, z) };
   </script>
 </body>
