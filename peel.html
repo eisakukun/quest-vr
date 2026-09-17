@@ -14,8 +14,8 @@
         linear-gradient(#8a8f96, #5b6068 55%, #3d4046);
     }
     #real {
-      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-      color: rgba(255,255,255,.55); font-size: 22px; letter-spacing: .1em; pointer-events: none;
+      position: absolute; left: 0; right: 0; bottom: 90px; text-align: center;
+      color: rgba(255,255,255,.45); font-size: 16px; letter-spacing: .1em; pointer-events: none;
     }
     canvas { position: absolute; inset: 0; }
     #hud {
@@ -38,13 +38,13 @@
   </style>
 </head>
 <body>
-  <div id="real">ここに 現実の部屋 が見える（Quest）</div>
+  <div id="real">（灰色のところ＝Questでは本物の部屋）</div>
   <div id="hud">
     🟩 <b>世界をはがす</b><br>
-    入ると現実にコードが降ってきて、まわりが壁になる<br>
-    グリップ or トリガーで <b>コードの壁をつかんで引っぱる</b> → 布みたいに剥がれて現実が出る<br>
-    半分以上はがして離すと、残りも全部落ちる<br>
-    A / X ボタン … もう一度（コードが降ってくる所から）<br>
+    最初は現実。真ん中に「everything around you is your creation」<br>
+    グリップ or トリガーで <b>まわりの現実をつかんで引っぱる</b> → 布みたいに剥がれて、裏からコードの世界が出る<br>
+    手を離した現実の切れ端はコードに分解されて消える／半分以上はがして離すと全部コードになる<br>
+    A / X ボタン … 現実にもどる<br>
     <small>パソコン：マウスでつかんで引く／矢印キーで見回す／Rでもどす</small>
   </div>
   <button id="enter" disabled>しらべ中…</button>
@@ -74,19 +74,20 @@
     import * as THREE from 'three';
 
     // ================= 調整つまみ =================
-    const R = 2.2;          // 世界（コードの壁のドーム）の半径 m。小さいほど手前
+    const R = 2.2;          // 現実の膜（剥がせる布のドーム）の半径 m。小さいほど手前
+    const R_CODE = 2.6;     // その奥にあるコードの世界の半径 m（Rより大きく）
     const EYE = 1.5;        // ドームの中心の高さ（ほぼ目の高さ）
     const SEG_W = 96, SEG_H = 48;
     const GRAVITY = -6;
     const DAMP = 0.985;
     const ITER = 6;         // 布の硬さ（多いほど伸びにくい）
     const GRAB_R = 0.35;    // つかむ範囲 m
-    const GAIN = 1.5;         // 光線の先の点に、手を動かした分×何倍を足すか
+    const GAIN = 1.5;       // 光線の先の点に、手を動かした分×何倍を足すか
     const PEEL_PER_PULL = 0.55; // 手（布）を1m引くと剥がれの半径が何m広がるか
     const MAX_BREAK = 40;   // 1コマで外れる最大数（剥がれが追いつく速さ）
     const COLLAPSE_ON_RELEASE = 0.45, COLLAPSE_WHILE_GRAB = 0.7;
-    const DISSOLVE_SEC = 1.6; // 手を離した布切れがコードに分解されて消えるまでの秒数
-    const INTRO_SEC = 6.5;  // 現実にコードが降ってきて壁になるまでの秒数
+    const DISSOLVE_SEC = 1.6; // 手を離した現実の切れ端がコードに分解されて消えるまでの秒数
+    const TITLE = 'everything around you is your creation';
     const RAIN_COLS = 160, RAIN_ROWS = 72; // コードのマス目（横一周・縦）
     const HEAD_R = 0.3;     // 布が頭をすり抜けない範囲 m
     const JAGGED = 0.3;     // 破れ目のギザギザ具合
@@ -95,15 +96,14 @@
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.setSize(innerWidth, innerHeight);
-    renderer.setClearColor(0x000000, 0);   // 透明＝剥がれたところは現実が見える
+    renderer.setClearColor(0x000000, 0);   // 透明＝現実（パススルー）が見える
     renderer.xr.enabled = true;
     renderer.xr.setReferenceSpaceType('local-floor');
     document.body.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 100);
+    const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.02, 100);
     camera.position.set(0, EYE, 0);
-    camera.near = 0.02; camera.updateProjectionMatrix();
     let yaw = 0, pitch = 0;
 
     addEventListener('resize', () => {
@@ -129,32 +129,95 @@
       t.generateMipmaps = false; t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
       return t;
     }
+    const atlas = makeGlyphAtlas();
+    const shared = { atlas: { value: atlas }, uTime: { value: 0 } };
 
-    // ================= 布のドーム =================
-    const geo = new THREE.SphereGeometry(R, SEG_W, SEG_H);
+    // コードの雨（2つの材質で共通）
+    const RAIN_GLSL = `
+      uniform sampler2D atlas; uniform float uTime;
+      const float COLS = ${RAIN_COLS}.0, ROWS = ${RAIN_ROWS}.0;
+      float h1(float n) { return fract(sin(n * 127.1 + 3.7) * 43758.5453); }
+      float h2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      // 1本の列に流れる1筋：先頭からの距離に応じた明るさ（先頭は白く光る）
+      vec2 stream(float col, float row, float seed) {
+        float sp = 5.0 + h1(col * 1.31 + seed) * 16.0;
+        float len = 6.0 + h1(col * 2.71 + seed) * 22.0;
+        float period = ROWS + len + h1(col * 5.13 + seed) * 50.0;
+        float headRow = mod(uTime * sp + h1(col + seed) * 300.0, period) - len * 0.5;
+        float d = headRow - row;
+        if (d < 0.0 || d > len) return vec2(0.0);
+        return vec2(pow(1.0 - d / len, 1.6), d < 1.0 ? 1.0 : 0.0);
+      }
+      // uv の位置の「文字の色（文字の形で切り抜き済み）」を返す
+      vec3 rain(vec2 uv, bool flipU, out vec2 cell, out float glyph) {
+        float u = flipU ? 1.0 - uv.x : uv.x;
+        vec2 grid = vec2(u * COLS, uv.y * ROWS);
+        cell = floor(grid);
+        vec2 f = fract(grid);
+        float col = cell.x, row = ROWS - 1.0 - cell.y;
+        float rate = 0.3 + h2(cell + 5.0) * 2.5;
+        float idx = floor(h2(cell + floor(uTime * rate + h2(cell) * 10.0) * 0.618) * 64.0);
+        vec2 fp = f * 0.84 + 0.08;
+        glyph = texture2D(atlas, vec2((mod(idx, 8.0) + fp.x) / 8.0, 1.0 - (floor(idx / 8.0) + 1.0 - fp.y) / 8.0)).r;
+        vec2 a = stream(col, row, 0.0), b = stream(col, row, 41.0);
+        vec3 g = vec3(0.1, 1.0, 0.35) * max(a.x, b.x) * 1.25 + vec3(0.8, 1.0, 0.85) * max(a.y, b.y);
+        g += vec3(0.0, 0.055, 0.02);
+        return g * glyph;
+      }`;
+
+    // 球を「上は丸天井・下は平らな床」の形にする
+    function domeGeometry(radius, floorY) {
+      const geo = new THREE.SphereGeometry(radius, SEG_W, SEG_H);
+      const p = geo.attributes.position.array;
+      const h = EYE - floorY;
+      for (let i = 0; i < p.length; i += 3) {
+        const dx = p[i] / radius, dy = p[i+1] / radius, dz = p[i+2] / radius;
+        const r = dy < 0 ? Math.min(radius, h / -dy) : radius;
+        p[i] = dx * r; p[i+1] = EYE + dy * r; p[i+2] = dz * r;
+      }
+      geo.computeVertexNormals();
+      return geo;
+    }
+
+    // ================= 奥：コードの世界（動かない） =================
+    const codeMat = new THREE.ShaderMaterial({
+      uniforms: shared,
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `
+        precision highp float;
+        ${RAIN_GLSL}
+        varying vec2 vUv;
+        void main() {
+          vec2 cell; float glyph;
+          vec3 col = vec3(0.0, 0.03, 0.01) + rain(vUv, true, cell, glyph);
+          gl_FragColor = vec4(col, 1.0);
+          #include <colorspace_fragment>
+        }`,
+      side: THREE.BackSide,
+    });
+    const codeWorld = new THREE.Mesh(domeGeometry(R_CODE, -0.03), codeMat);
+    codeWorld.renderOrder = 1;        // 現実の膜のあとに描く＝膜がある所ではコードは隠れる
+    codeWorld.frustumCulled = false;
+    scene.add(codeWorld);
+
+    // ================= 手前：現実の膜（剥がせる布） =================
+    const geo = domeGeometry(R, 0);
     const N = geo.attributes.position.count;
     const cols = SEG_W + 1;
-    const rest = new Float32Array(N * 3);
-    {
-      const p = geo.attributes.position.array;
-      for (let i = 0; i < N; i++) {
-        let dx = p[i*3] / R, dy = p[i*3+1] / R, dz = p[i*3+2] / R;
-        // 下半分は床（y=0）で平らにする＝仮想の地面が現実の床と同じ高さ
-        let r = R;
-        if (dy < 0) r = Math.min(R, EYE / -dy);
-        rest[i*3] = dx * r; rest[i*3+1] = EYE + dy * r; rest[i*3+2] = dz * r;
-      }
-      p.set(rest);
-      geo.computeVertexNormals();
-      geo.setAttribute('nRest', new THREE.BufferAttribute(geo.attributes.normal.array.slice(), 3));
-      geo.setAttribute('aFree', new THREE.BufferAttribute(new Float32Array(N), 1));
-      geo.setAttribute('aDiss', new THREE.BufferAttribute(new Float32Array(N), 1));
-    }
+    const rest = new Float32Array(geo.attributes.position.array);
+    geo.setAttribute('nRest', new THREE.BufferAttribute(geo.attributes.normal.array.slice(), 3));
+    geo.setAttribute('aFree', new THREE.BufferAttribute(new Float32Array(N), 1));
+    geo.setAttribute('aDiss', new THREE.BufferAttribute(new Float32Array(N), 1));
+    geo.setAttribute('aEdge', new THREE.BufferAttribute(new Float32Array(N), 1));
     const pos = geo.attributes.position.array;
     const prev = new Float32Array(rest);
     const pinned = new Uint8Array(N).fill(1);
     const grabOf = new Int8Array(N).fill(-1);
     const offset = new Float32Array(N * 3);
+    const diss = geo.attributes.aDiss.array; // 0=ふつう → 1=消えた
+    const edge = geo.attributes.aEdge.array; // 1=破れ目のふち
 
     // 糸（拘束）：横・縦・ななめ・継ぎ目
     const cA = [], cB = [], cL = [];
@@ -171,7 +234,7 @@
     for (let iy = 0; iy <= SEG_H; iy++) addC(vid(iy, 0), vid(iy, SEG_W)); // 継ぎ目を縫う
     const CA = Int32Array.from(cA), CB = Int32Array.from(cB), CL = Float32Array.from(cL);
     const NC = CA.length;
-    // 点ごとの「つながっている糸」一覧（手に持っている布切れを辿るため）
+    // 点ごとの「つながっている糸」一覧（手に持っている切れ端を辿るため）
     const adjStart = new Int32Array(N + 1), adjC = new Int32Array(NC * 2);
     {
       for (let c = 0; c < NC; c++) { adjStart[CA[c] + 1]++; adjStart[CB[c] + 1]++; }
@@ -179,9 +242,8 @@
       const fill = adjStart.slice(0, N);
       for (let c = 0; c < NC; c++) { adjC[fill[CA[c]]++] = c; adjC[fill[CB[c]]++] = c; }
     }
-    const diss = geo.attributes.aDiss.array; // 0=ふつう → 1=消えた
     const held = new Uint8Array(N), bfs = new Int32Array(N);
-    // 破れ目をギザギザにするための、点ごとのゆらぎ（なめらかなノイズ）
+    // 破れ目をギザギザにするための、点ごとのゆらぎ
     const jag = new Float32Array(N);
     for (let i = 0; i < N; i++) {
       const x = rest[i*3], y = rest[i*3+1], z = rest[i*3+2];
@@ -189,97 +251,64 @@
     }
 
     const clothMat = new THREE.ShaderMaterial({
-      uniforms: {
-        atlas: { value: makeGlyphAtlas() },
-        uTime: { value: 0 },
-        uIntro: { value: 0 },   // 登場アニメの経過秒（終わったら大きい数）
-        opacity: { value: 1 },
-      },
+      uniforms: shared,
       vertexShader: `
-        attribute vec3 nRest; attribute float aFree; attribute float aDiss;
-        varying float vDiss;
-        varying vec2 vUv; varying vec3 vN; varying vec3 vNR; varying float vFree;
+        attribute vec3 nRest; attribute float aFree; attribute float aDiss; attribute float aEdge;
+        varying vec2 vUv; varying vec3 vN; varying vec3 vNR; varying float vFree; varying float vDiss; varying float vEdge;
         void main() {
-          vUv = uv; vN = normal; vNR = nRest; vFree = aFree; vDiss = aDiss;
+          vUv = uv; vN = normal; vNR = nRest; vFree = aFree; vDiss = aDiss; vEdge = aEdge;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
         }`,
       fragmentShader: `
         precision highp float;
-        uniform sampler2D atlas; uniform float uTime; uniform float uIntro; uniform float opacity;
-        varying vec2 vUv; varying vec3 vN; varying vec3 vNR; varying float vFree; varying float vDiss;
-        const float COLS = ${RAIN_COLS}.0, ROWS = ${RAIN_ROWS}.0;
-        float h1(float n) { return fract(sin(n * 127.1 + 3.7) * 43758.5453); }
-        float h2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-
-        // 1本の列に流れる1筋：先頭からの距離に応じた明るさ（先頭は白く光る）
-        vec2 stream(float col, float row, float seed) {
-          float sp = 5.0 + h1(col * 1.31 + seed) * 16.0;        // 1秒に何マス落ちるか
-          float len = 6.0 + h1(col * 2.71 + seed) * 22.0;       // しっぽの長さ
-          float period = ROWS + len + h1(col * 5.13 + seed) * 50.0;
-          float headRow = mod(uTime * sp + h1(col + seed) * 300.0, period) - len * 0.5;
-          float d = headRow - row;
-          if (d < 0.0 || d > len) return vec2(0.0);
-          return vec2(pow(1.0 - d / len, 1.6), d < 1.0 ? 1.0 : 0.0);
-        }
-
+        ${RAIN_GLSL}
+        varying vec2 vUv; varying vec3 vN; varying vec3 vNR; varying float vFree; varying float vDiss; varying float vEdge;
         void main() {
-          if (vFree > 0.001 && vFree < 0.999) discard; // 貼ってある所と剥がれた布をまたぐ三角形は描かない
-          float k = abs(dot(normalize(vN), normalize(vNR)));  // しわ・折れの陰
-          float u = gl_FrontFacing ? vUv.x : 1.0 - vUv.x;
-          vec2 grid = vec2(u * COLS, vUv.y * ROWS);
-          vec2 cell = floor(grid), f = fract(grid);
-          float col = cell.x, row = ROWS - 1.0 - cell.y;      // row は上から数える
-
-          // 文字（ふだんはほぼ固定、ときどき入れ替わる）
-          float rate = 0.3 + h2(cell + 5.0) * 2.5;
-          float idx = floor(h2(cell + floor(uTime * rate + h2(cell) * 10.0) * 0.618) * 64.0);
-          vec2 fp = f * 0.84 + 0.08;
-          float glyph = texture2D(atlas, vec2((mod(idx, 8.0) + fp.x) / 8.0, 1.0 - (floor(idx / 8.0) + 1.0 - fp.y) / 8.0)).r;
-
-          vec2 a = stream(col, row, 0.0), b = stream(col, row, 41.0);
-          float inten = max(a.x, b.x), headG = max(a.y, b.y);
-          vec3 gcol = vec3(0.1, 1.0, 0.35) * inten * 1.25 + vec3(0.8, 1.0, 0.85) * headG;
-          gcol += vec3(0.0, 0.055, 0.02);                      // 流れていない所もうっすら文字
-
-          // 登場：列ごとに少しずれて上からコードが降りてくる → そのあと黒い壁が埋まる
-          float front = (uIntro - h1(col * 3.3) * 1.6) * 24.0;
-          float shown = step(row, front);
-          float frontHead = step(abs(row - front), 1.0);
-          gcol = gcol * shown + vec3(0.85, 1.0, 0.9) * frontHead * 1.2;
-          float bgA = clamp((uIntro - 2.6 - h1(col * 7.7) * 1.4 - (row / ROWS) * 1.2) / 1.2, 0.0, 1.0);
-
-          // 分解：まず黒い地が抜けて文字だけ光り、文字がひとつずつ消えていく
+          if (vFree > 0.001 && vFree < 0.999) discard; // 貼ってある所と剥がれた所をまたぐ三角形は描かない
+          if (vDiss > 0.995) discard;
+          float k = abs(dot(normalize(vN), normalize(vNR)));  // しわ・折れ
+          float e = pow(clamp(vEdge, 0.0, 1.0), 10.0);        // 破れ目のふちの光（細く）
+          vec3 glow = vec3(0.12, 1.0, 0.4);
+          vec3 rgb; float a;
+          vec2 cell; float glyph;
+          vec3 g = rain(vUv, !gl_FrontFacing, cell, glyph);
+          if (vFree < 0.5) {
+            // 貼ってある現実：透明（奥のコードを隠して、パススルーをそのまま見せる）。ふちだけ緑に光る
+            a = e * 0.75; rgb = glow * a;
+          } else if (gl_FrontFacing) {
+            // めくれた現実の裏側：コードでできている
+            a = 0.92; rgb = vec3(0.0, 0.03, 0.01) + g * (0.35 + 0.65 * k);
+          } else {
+            // 剥がした現実の切れ端（内側）：部屋が暗く透けて、うっすらコードがにじむ
+            a = 0.2 + (1.0 - k) * 0.4;
+            rgb = g * 0.3;
+          }
+          rgb += glow * e * 0.75; a = max(a, e * 0.75);
+          // 分解：膜が抜けて文字だけ光り、文字がひとつずつ消えていく
           if (vDiss > 0.001) {
             float hd = h2(cell + 17.0);
-            if (vDiss > 0.995 || hd < vDiss * 1.2 - 0.2) discard;
-            bgA *= 1.0 - smoothstep(0.0, 0.35, vDiss);
-            if (hd < vDiss * 1.2) gcol = vec3(0.7, 1.0, 0.78) * 1.4;          // 消える直前に白く光る
-            else gcol = max(gcol, vec3(0.1, 1.0, 0.35) * smoothstep(0.0, 0.3, vDiss));
+            if (hd < vDiss * 1.2 - 0.2) discard;
+            float fade = smoothstep(0.0, 0.35, vDiss);
+            rgb *= 1.0 - fade; a *= 1.0 - fade;
+            if (hd < vDiss * 1.2) { rgb = vec3(0.7, 1.0, 0.78) * 1.4 * glyph; a = max(a, glyph); }
+            else { rgb += vec3(0.1, 1.0, 0.35) * glyph * fade; a = max(a, glyph * fade); }
           }
-          gcol *= glyph;
-          if (gl_FrontFacing) gcol *= 0.45;                    // 外側（裏）は暗め
-          gcol *= 0.35 + 0.65 * k;
-          vec3 bg = vec3(0.0, 0.03, 0.01) * (0.35 + 0.65 * k);
-          float ag = clamp(max(gcol.r, max(gcol.g, gcol.b)), 0.0, 1.0);
-          float alpha = max(bgA, ag);
-          if (alpha < 0.003) discard;
-          vec3 rgb = (bg * bgA * (1.0 - ag) + gcol) / alpha;
-          gl_FragColor = vec4(rgb, alpha * opacity);
+          gl_FragColor = vec4(rgb, a);
           #include <colorspace_fragment>
         }`,
       side: THREE.DoubleSide,
-      transparent: true,
-      depthWrite: true,
+      // 不透明扱い＝色を混ぜずにそのまま書く。深度を書くので、膜の奥のコードは描かれない
     });
     const cloth = new THREE.Mesh(geo, clothMat);
+    cloth.renderOrder = 0;
     cloth.frustumCulled = false;
     scene.add(cloth);
 
     // ================= 状態 =================
-    // intro（現実にコードが降ってくる） → covered（はがせる） → collapsing（残りが落ちる） → settling → fading → reality → (A/X) intro
-    let state = 'intro', stateT = 0, collapseOrigin = new THREE.Vector3();
+    // covered（現実・はがせる） → collapsing（残りが落ちる） → settling（分解中） → code（全部コード） → (A/X) covered
+    let state = 'covered', stateT = 0, collapseOrigin = new THREE.Vector3();
     const grabs = [null, null, null]; // 0,1=コントローラー 2=マウス
-    let breaksThisFrame = 0;
+    let breaksThisFrame = 0, grabbedOnce = false;
 
     function freeCount() { let n = 0; for (let i = 0; i < N; i++) if (!pinned[i]) n++; return n; }
 
@@ -299,7 +328,8 @@
         offset[i*3+2] = (pos[i*3+2] - hitPoint.z) * 0.35;
       }
       grabs[slot] = { hit: hitPoint.clone(), target: target.clone() };
-      hideHint();
+      grabbedOnce = true;
+      hideHint(); titleTarget = 0;
       return true;
     }
 
@@ -316,16 +346,17 @@
       for (let s = 0; s < grabs.length; s++) if (grabs[s]) { for (let i = 0; i < N; i++) if (grabOf[i] === s) grabOf[i] = -1; grabs[s] = null; }
     }
 
-    // もう一度、現実からコードが降ってくるところから
+    // 現実にもどる（真ん中の言葉から）
     function reset() {
       for (let s = 0; s < grabs.length; s++) grabs[s] = null;
       grabOf.fill(-1);
       pos.set(rest); prev.set(rest);
-      pinned.fill(1); diss.fill(0); geo.attributes.aDiss.needsUpdate = true;
-      clothMat.uniforms.opacity.value = 1;
-      state = 'intro'; stateT = 0;
+      pinned.fill(1); diss.fill(0); edge.fill(0);
+      geo.attributes.aDiss.needsUpdate = true; geo.attributes.aEdge.needsUpdate = true;
+      state = 'covered'; stateT = 0; grabbedOnce = false;
       cloth.visible = true;
       hideHint();
+      startTitle();
     }
 
     // ================= 布の計算 =================
@@ -351,8 +382,8 @@
         for (let c = 0; c < NC; c++) {
           const a = CA[c], b = CB[c];
           if (pinned[a] || pinned[b]) continue; // 貼ってある所との糸は効かない（剥がれた布どうしは1枚につながったまま）
-          const wa = (pinned[a] || grabOf[a] >= 0) ? 0 : 1;
-          const wb = (pinned[b] || grabOf[b] >= 0) ? 0 : 1;
+          const wa = grabOf[a] >= 0 ? 0 : 1;
+          const wb = grabOf[b] >= 0 ? 0 : 1;
           if (wa + wb === 0) continue;
           const a3 = a * 3, b3 = b * 3;
           const dx = pos[b3] - pos[a3], dy = pos[b3+1] - pos[a3+1], dz = pos[b3+2] - pos[a3+2];
@@ -362,7 +393,7 @@
           pos[a3] += dx * k * wa; pos[a3+1] += dy * k * wa; pos[a3+2] += dz * k * wa;
           pos[b3] -= dx * k * wb; pos[b3+1] -= dy * k * wb; pos[b3+2] -= dz * k * wb;
         }
-        // 現実の床に積もる／頭はすり抜けない
+        // 床に積もる／頭はすり抜けない
         for (let i = 0; i < N; i++) {
           const i3 = i * 3;
           if (pinned[i] || grabOf[i] >= 0) continue;
@@ -399,15 +430,17 @@
     // ================= 入力：コントローラー =================
     const raycaster = new THREE.Raycaster();
     const tmpM = new THREE.Matrix4();
+    const visibleHit = h => diss[h.face.a] < 0.5 || diss[h.face.b] < 0.5 || diss[h.face.c] < 0.5;
     const ctrls = [];
     for (let i = 0; i < 2; i++) {
       const ctrl = renderer.xr.getController(i);
       const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]);
       const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0x33ff77, transparent: true, opacity: 0.8 }));
       line.scale.z = 3;
+      line.renderOrder = 5;
       ctrl.add(line);
       const dot = new THREE.Mesh(new THREE.SphereGeometry(0.03, 12, 8), new THREE.MeshBasicMaterial({ color: 0xccffdd }));
-      dot.visible = false;
+      dot.visible = false; dot.renderOrder = 5;
       scene.add(ctrl); scene.add(dot);
       const info = { ctrl, line, dot, source: null, startPos: new THREE.Vector3(), dist: 0, btnPrev: false };
       ctrl.addEventListener('connected', e => { info.source = e.data; });
@@ -435,7 +468,7 @@
       setRay(ctrl);
       raycaster.far = 30;
       if (!cloth.visible) return null;
-      return raycaster.intersectObject(cloth, false).find(h => diss[h.face.a] < 0.5 || diss[h.face.b] < 0.5 || diss[h.face.c] < 0.5) || null;
+      return raycaster.intersectObject(cloth, false).find(visibleHit) || null;
     }
 
     const cp = new THREE.Vector3();
@@ -453,12 +486,12 @@
           c.line.scale.z = raycaster.ray.origin.distanceTo(g.target);
           c.dot.visible = false;
         } else if (renderer.xr.isPresenting) {
-          const hit = rayHit(c.ctrl);
+          const hit = state === 'covered' ? rayHit(c.ctrl) : null;
           c.dot.visible = !!hit;
           if (hit) { c.dot.position.copy(hit.point); c.line.scale.z = hit.distance; }
           else c.line.scale.z = 3;
         }
-        // A/X（4番）かB/Y（5番）でもどす
+        // A/X（4番）かB/Y（5番）で現実にもどる
         const gp = c.source && c.source.gamepad;
         if (gp) {
           const pressed = !!((gp.buttons[4] && gp.buttons[4].pressed) || (gp.buttons[5] && gp.buttons[5].pressed));
@@ -479,7 +512,7 @@
       audioOn();
       mouse.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
       raycaster.setFromCamera(mouse, camera);
-      const hit = cloth.visible && raycaster.intersectObject(cloth, false).find(h => diss[h.face.a] < 0.5 || diss[h.face.b] < 0.5 || diss[h.face.c] < 0.5);
+      const hit = cloth.visible && raycaster.intersectObject(cloth, false).find(visibleHit);
       if (!hit) return;
       mouseDist = hit.distance;
       startGrab(2, hit.point, hit.point);
@@ -500,7 +533,7 @@
     addEventListener('keyup', e => { keys[e.key] = false; });
     document.getElementById('resetBtn').onclick = reset;
 
-    // ================= 音（布が裂けるザザッ） =================
+    // ================= 音（現実が裂けるザザッ） =================
     let audio = null;
     function audioOn() {
       if (audio) { audio.ctx.resume(); return; }
@@ -517,6 +550,16 @@
       } catch (e) {}
     }
 
+    // ================= 目の前に置く物の位置 =================
+    function placeInFront(obj, dist, dy) {
+      const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
+      const p = new THREE.Vector3(), q = new THREE.Vector3(0, 0, -1);
+      cam.getWorldPosition(p); q.applyQuaternion(cam.getWorldQuaternion(new THREE.Quaternion())); q.y = 0; q.normalize();
+      obj.position.copy(p).addScaledVector(q, dist); obj.position.y = p.y + dy;
+      obj.lookAt(p.x, obj.position.y, p.z);
+      obj.visible = true;
+    }
+
     // ================= 案内の札（VRの中） =================
     function makeHint(text) {
       const c = document.createElement('canvas'); c.width = 1024; c.height = 256;
@@ -529,19 +572,65 @@
       return t;
     }
     const hintMat = new THREE.MeshBasicMaterial({ transparent: true, depthTest: false });
-    const hint = new THREE.Mesh(new THREE.PlaneGeometry(0.8, 0.2), hintMat);
+    const hint = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.15), hintMat);
     hint.renderOrder = 10; hint.visible = false; scene.add(hint);
-    const hintTex = { grab: makeHint('コードの壁をつかんで\n引っぱってみて'), back: makeHint('A / X で もう一度') };
+    const hintTex = { grab: makeHint('まわりの現実をつかんで\n引っぱってみて'), back: makeHint('A / X で 現実にもどる') };
     function showHint(kind) {
       hintMat.map = hintTex[kind]; hintMat.needsUpdate = true;
-      const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
-      const p = new THREE.Vector3(), q = new THREE.Vector3(0, 0, -1);
-      cam.getWorldPosition(p); q.applyQuaternion(cam.getWorldQuaternion(new THREE.Quaternion())); q.y = 0; q.normalize();
-      hint.position.copy(p).addScaledVector(q, 0.9); hint.position.y = p.y - 0.15;
-      hint.lookAt(p.x, hint.position.y, p.z);
-      hint.visible = true;
+      placeInFront(hint, 0.95, -0.22);
     }
     function hideHint() { hint.visible = false; }
+
+    // ================= 真ん中の言葉（1文字ずつコードがパラパラ変わって確定する） =================
+    const titleCanvas = document.createElement('canvas'); titleCanvas.width = 2048; titleCanvas.height = 180;
+    const tg = titleCanvas.getContext('2d');
+    const titleTex = new THREE.CanvasTexture(titleCanvas); titleTex.colorSpace = THREE.SRGBColorSpace;
+    const titleMat = new THREE.MeshBasicMaterial({ map: titleTex, transparent: true, depthTest: false, opacity: 0 });
+    const title = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 1.4 * 180 / 2048), titleMat);
+    title.renderOrder = 11; title.visible = false; scene.add(title);
+    const SCRAMBLE = 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789';
+    const T_START = 0.6, T_PER = 0.06, T_SETTLE = 0.35;
+    const TYPING_END = T_START + TITLE.length * T_PER + T_SETTLE;
+    let titleT = 0, titleTarget = 0, titlePlaced = false, titleDone = false;
+
+    function startTitle() {
+      titleT = 0; titleTarget = 1; titlePlaced = false; titleDone = false;
+      titleMat.opacity = 1; title.visible = false;
+    }
+    function drawTitle() {
+      const W = titleCanvas.width, H = titleCanvas.height;
+      tg.clearRect(0, 0, W, H);
+      tg.font = 'bold 76px "Courier New", Menlo, monospace';
+      tg.textAlign = 'center'; tg.textBaseline = 'middle';
+      const cw = W * 0.92 / TITLE.length, x0 = (W - cw * TITLE.length) / 2;
+      let last = -1;
+      for (let i = 0; i < TITLE.length; i++) {
+        const ti = titleT - T_START - i * T_PER;
+        if (ti < 0) break;
+        last = i;
+        if (TITLE[i] === ' ') continue;
+        const settling = ti < T_SETTLE;
+        const ch = settling ? SCRAMBLE[Math.floor(Math.random() * SCRAMBLE.length)] : TITLE[i];
+        tg.shadowColor = '#22ff66'; tg.shadowBlur = settling ? 28 : 16;
+        tg.fillStyle = settling ? '#e6fff0' : '#6dff9c';
+        tg.fillText(ch, x0 + cw * (i + 0.5), H / 2);
+      }
+      // カーソル（点滅）
+      if (Math.floor(titleT * 2.5) % 2 === 0) {
+        tg.shadowBlur = 16; tg.fillStyle = '#6dff9c';
+        tg.fillRect(x0 + cw * (last + 1) + cw * 0.15, H / 2 - 34, cw * 0.7, 68);
+      }
+      titleTex.needsUpdate = true;
+    }
+    function updateTitle(dt) {
+      if (titleTarget === 0 && titleMat.opacity <= 0) { title.visible = false; return; }
+      titleT += dt;
+      if (!titlePlaced && titleT > 0.15) { titlePlaced = true; placeInFront(title, 1.0, 0.02); }
+      if (!titleDone) { drawTitle(); if (titleT > TYPING_END + 3) titleDone = true; }
+      titleMat.opacity += Math.sign(titleTarget - titleMat.opacity) * Math.min(Math.abs(titleTarget - titleMat.opacity), dt / 0.6);
+      // 言葉が出きったら、つかみ方の札
+      if (renderer.xr.isPresenting && !grabbedOnce && state === 'covered' && !hint.visible && titleT > TYPING_END + 0.8) showHint('grab');
+    }
 
     // ================= 入口ボタン =================
     const enterBtn = document.getElementById('enter');
@@ -565,6 +654,7 @@
     };
 
     // ================= ループ =================
+    startTitle();
     const clock = new THREE.Clock();
     let acc = 0;
     renderer.setAnimationLoop(() => frame(Math.min(clock.getDelta(), 0.1)));
@@ -579,13 +669,9 @@
         if (keys.ArrowDown) pitch = Math.max(-1.4, pitch - dt * 1.2);
         camera.rotation.set(pitch, yaw, 0, 'YXZ');
       }
-      if (firstXRFrame && renderer.xr.isPresenting) { firstXRFrame = false; reset(); } // 入った瞬間は現実、そこへコードが降る
-      clothMat.uniforms.uTime.value += dt;
-      clothMat.uniforms.uIntro.value = state === 'intro' ? stateT : 999;
-      if (state === 'intro' && stateT > INTRO_SEC) {
-        state = 'covered'; stateT = 0;
-        if (renderer.xr.isPresenting) showHint('grab');
-      }
+      if (firstXRFrame && renderer.xr.isPresenting) { firstXRFrame = false; reset(); } // 入った瞬間は現実＋真ん中の言葉
+      shared.uTime.value += dt;
+      updateTitle(dt);
 
       if (renderer.xr.isPresenting) renderer.xr.getCamera().getWorldPosition(head);
       else head.copy(camera.position);
@@ -600,22 +686,22 @@
           if (d < reach) { pinned[i] = 0; breaksThisFrame++; } else left++;
         }
         if (!left) { state = 'settling'; stateT = 0; }
-      } else if (state === 'settling' && stateT > 2.5) {
-        state = 'fading'; stateT = 0;
-      } else if (state === 'fading') {
-        clothMat.uniforms.opacity.value = Math.max(0, 1 - stateT / 1.5);
-        if (stateT > 1.5) { state = 'reality'; cloth.visible = false; if (renderer.xr.isPresenting) showHint('back'); }
+      } else if (state === 'settling') {
+        let min = 1;
+        for (let i = 0; i < N; i++) if (diss[i] < min) min = diss[i];
+        if (min >= 1 || stateT > DISSOLVE_SEC + 1.5) {
+          state = 'code'; stateT = 0; cloth.visible = false;
+          if (renderer.xr.isPresenting) showHint('back');
+        }
       }
 
-      if (state !== 'reality' && state !== 'intro') {
+      if (state !== 'code') {
         acc += dt;
         let n = 0;
         while (acc >= H_DT && n < 3) { step(H_DT); acc -= H_DT; n++; }
         if (n === 3) acc = 0;
-      }
 
-      // 手から離れた布切れ（持っている所と糸でつながっていない所）はコードに分解されて消える
-      if (state !== 'intro' && state !== 'reality') {
+        // 手から離れた現実の切れ端（持っている所と糸で辿れない所）はコードに分解されて消える
         held.fill(0);
         let qn = 0;
         for (let i = 0; i < N; i++) if (grabOf[i] >= 0) { held[i] = 1; bfs[qn++] = i; }
@@ -627,15 +713,19 @@
             if (!held[o] && !pinned[o]) { held[o] = 1; bfs[qn++] = o; }
           }
         }
-        let changed = false;
         for (let i = 0; i < N; i++) {
           if (pinned[i] || held[i] || diss[i] >= 1) continue;
-          diss[i] = Math.min(1, diss[i] + dt / DISSOLVE_SEC); changed = true;
+          diss[i] = Math.min(1, diss[i] + dt / DISSOLVE_SEC);
         }
-        if (changed) geo.attributes.aDiss.needsUpdate = true;
-      }
+        geo.attributes.aDiss.needsUpdate = true;
 
-      if (cloth.visible) {
+        // 破れ目のふち（貼ってある所と剥がれた所の境目）
+        edge.fill(0);
+        for (let c = 0; c < NC; c++) {
+          if (pinned[CA[c]] !== pinned[CB[c]]) { edge[CA[c]] = 1; edge[CB[c]] = 1; }
+        }
+        geo.attributes.aEdge.needsUpdate = true;
+
         const fr = geo.attributes.aFree.array;
         for (let i = 0; i < N; i++) fr[i] = pinned[i] ? 0 : 1;
         geo.attributes.aFree.needsUpdate = true;
